@@ -9,14 +9,21 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const BASE_REF: &str = "refs/remotes/origin/main";
-const DEFAULT_REMOTE: &str = "origin";
+pub const DEFAULT_BASE_REMOTE: &str = "origin";
+pub const DEFAULT_BASE_BRANCH: &str = "main";
+
+#[derive(Debug, Clone)]
+pub struct CreateRepoSpec {
+    pub path: PathBuf,
+    pub base_remote: String,
+    pub base_branch: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct CreateWorkspaceRequest {
     pub workspace_name: Option<String>,
     pub branch_name: Option<String>,
-    pub repo_paths: Vec<PathBuf>,
+    pub repos: Vec<CreateRepoSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +176,8 @@ struct ResolvedRepo {
     repo_name: String,
     repo_root: PathBuf,
     worktree_path: PathBuf,
+    base_remote: String,
+    base_branch: String,
     base_commit: String,
 }
 
@@ -195,7 +204,7 @@ impl WorkspaceManager {
     }
 
     pub fn create(&self, request: CreateWorkspaceRequest) -> Result<CreateWorkspaceResult> {
-        if request.repo_paths.is_empty() {
+        if request.repos.is_empty() {
             bail!("at least one repository path is required");
         }
 
@@ -231,7 +240,7 @@ impl WorkspaceManager {
             );
         }
 
-        let mut repos = resolve_repos(&request.repo_paths, &branch_name, &workspace_dir, &[])?;
+        let mut repos = resolve_repos(&request.repos, &branch_name, &workspace_dir, &[])?;
         let stashed_repos = auto_stash_repos(&repos, &workspace_name)?;
 
         if let Err(error) = populate_base_commits(&mut repos) {
@@ -296,8 +305,17 @@ impl WorkspaceManager {
             );
         }
 
+        let add_specs = request
+            .repo_paths
+            .iter()
+            .map(|path| CreateRepoSpec {
+                path: path.clone(),
+                base_remote: DEFAULT_BASE_REMOTE.to_owned(),
+                base_branch: DEFAULT_BASE_BRANCH.to_owned(),
+            })
+            .collect::<Vec<_>>();
         let mut repos = resolve_repos(
-            &request.repo_paths,
+            &add_specs,
             &workspace.branch_name,
             &workspace.workspace_dir,
             &workspace.repos,
@@ -523,8 +541,9 @@ impl WorkspaceManager {
         let mut created = Vec::new();
 
         for repo in &repos {
+            let base_ref = format!("refs/remotes/{}/{}", repo.base_remote, repo.base_branch);
             if let Err(error) =
-                git::create_worktree(&repo.repo_root, &repo.worktree_path, branch_name, BASE_REF)
+                git::create_worktree(&repo.repo_root, &repo.worktree_path, branch_name, &base_ref)
             {
                 let _ = git::remove_worktree(&repo.repo_root, &repo.worktree_path);
                 let _ = git::delete_local_branch(&repo.repo_root, branch_name);
@@ -542,8 +561,8 @@ impl WorkspaceManager {
                 repo_name: repo.repo_name,
                 source_repo_path: repo.repo_root,
                 worktree_path: repo.worktree_path,
-                remote_name: DEFAULT_REMOTE.to_owned(),
-                base_ref: "origin/main".to_owned(),
+                base_ref: format!("{}/{}", repo.base_remote, repo.base_branch),
+                remote_name: repo.base_remote,
                 base_commit: repo.base_commit,
             })
             .collect())
@@ -639,7 +658,7 @@ fn validate_branch_name(branch_name: &str) -> Result<()> {
 }
 
 fn resolve_repos(
-    requested_paths: &[PathBuf],
+    requested: &[CreateRepoSpec],
     branch_name: &str,
     workspace_dir: &Path,
     existing_repos: &[RepoRecord],
@@ -655,11 +674,11 @@ fn resolve_repos(
         .map(|repo| repo.repo_name.clone())
         .collect::<HashSet<_>>();
 
-    for requested_path in requested_paths {
-        let repo_root = git::resolve_repo_root(requested_path).with_context(|| {
+    for spec in requested {
+        let repo_root = git::resolve_repo_root(&spec.path).with_context(|| {
             format!(
                 "failed to treat {} as a local git repository",
-                requested_path.display()
+                spec.path.display()
             )
         })?;
         let repo_root = fs::canonicalize(&repo_root)
@@ -676,10 +695,11 @@ fn resolve_repos(
             );
         }
 
-        if !git::has_remote_origin(&repo_root)? {
+        if !git::has_remote(&repo_root, &spec.base_remote)? {
             bail!(
-                "repository {} does not have an `origin` remote",
-                repo_root.display()
+                "repository {} does not have a `{}` remote",
+                repo_root.display(),
+                spec.base_remote
             );
         }
 
@@ -718,6 +738,8 @@ fn resolve_repos(
             repo_name,
             repo_root,
             worktree_path,
+            base_remote: spec.base_remote.clone(),
+            base_branch: spec.base_branch.clone(),
             base_commit: String::new(),
         });
     }
@@ -757,14 +779,17 @@ fn auto_stash_repos(repos: &[ResolvedRepo], workspace_name: &str) -> Result<Vec<
 
 fn populate_base_commits(repos: &mut [ResolvedRepo]) -> Result<()> {
     for repo in repos {
-        git::fetch_origin_main(&repo.repo_root)?;
-        if !git::remote_main_exists(&repo.repo_root)? {
+        git::fetch_remote_branch(&repo.repo_root, &repo.base_remote, &repo.base_branch)?;
+        if !git::remote_branch_exists(&repo.repo_root, &repo.base_remote, &repo.base_branch)? {
             bail!(
-                "repository {} does not have refs/remotes/origin/main after fetch",
-                repo.repo_root.display()
+                "repository {} does not have refs/remotes/{}/{} after fetch",
+                repo.repo_root.display(),
+                repo.base_remote,
+                repo.base_branch,
             );
         }
-        repo.base_commit = git::remote_main_commit(&repo.repo_root)?;
+        repo.base_commit =
+            git::remote_branch_commit(&repo.repo_root, &repo.base_remote, &repo.base_branch)?;
     }
 
     Ok(())
@@ -954,8 +979,9 @@ fn current_epoch_seconds() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_base_dir, AddWorkspaceReposRequest, CreateWorkspaceRequest, RemoveBranchAction,
-        RemoveWorkspaceRequest, WorkspaceHealth, WorkspaceManager,
+        default_base_dir, AddWorkspaceReposRequest, CreateRepoSpec, CreateWorkspaceRequest,
+        RemoveBranchAction, RemoveWorkspaceRequest, WorkspaceHealth, WorkspaceManager,
+        DEFAULT_BASE_BRANCH, DEFAULT_BASE_REMOTE,
     };
     use crate::git;
     use anyhow::{Context, Result};
@@ -963,6 +989,17 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::tempdir;
+
+    fn default_specs(paths: Vec<PathBuf>) -> Vec<CreateRepoSpec> {
+        paths
+            .into_iter()
+            .map(|path| CreateRepoSpec {
+                path,
+                base_remote: DEFAULT_BASE_REMOTE.into(),
+                base_branch: DEFAULT_BASE_BRANCH.into(),
+            })
+            .collect()
+    }
 
     #[test]
     fn default_base_dir_ends_in_spaces() -> Result<()> {
@@ -981,7 +1018,7 @@ mod tests {
         let result = manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_one.clone(), repo_two.clone()],
+            repos: default_specs(vec![repo_one.clone(), repo_two.clone()]),
         })?;
 
         assert_eq!(result.workspace_name, "steady-trail");
@@ -1022,7 +1059,7 @@ mod tests {
         let result = manager.create(CreateWorkspaceRequest {
             workspace_name: Some("rapid-signal".into()),
             branch_name: None,
-            repo_paths: vec![repo_one, repo_two.clone()],
+            repos: default_specs(vec![repo_one, repo_two.clone()]),
         })?;
 
         assert_eq!(result.stashed_source_repos.len(), 1);
@@ -1053,7 +1090,7 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_one.clone()],
+            repos: default_specs(vec![repo_one.clone()]),
         })?;
 
         let result = manager.add(AddWorkspaceReposRequest {
@@ -1090,7 +1127,7 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_one],
+            repos: default_specs(vec![repo_one]),
         })?;
 
         let result = manager.add(AddWorkspaceReposRequest {
@@ -1122,7 +1159,7 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_one.clone()],
+            repos: default_specs(vec![repo_one.clone()]),
         })?;
 
         let error = manager
@@ -1162,7 +1199,7 @@ mod tests {
             .create(CreateWorkspaceRequest {
                 workspace_name: Some("broken-flight".into()),
                 branch_name: None,
-                repo_paths: vec![repo_one, repo_two.clone()],
+                repos: default_specs(vec![repo_one, repo_two.clone()]),
             })
             .expect_err("fetch should fail after auto-stash");
 
@@ -1187,7 +1224,7 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("merry-forest".into()),
             branch_name: None,
-            repo_paths: vec![repo_one.clone(), repo_two.clone()],
+            repos: default_specs(vec![repo_one.clone(), repo_two.clone()]),
         })?;
 
         let result = manager.remove(RemoveWorkspaceRequest {
@@ -1214,7 +1251,7 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("tidy-voyage".into()),
             branch_name: None,
-            repo_paths: vec![repo_one.clone(), repo_two.clone()],
+            repos: default_specs(vec![repo_one.clone(), repo_two.clone()]),
         })?;
 
         manager.remove(RemoveWorkspaceRequest {
@@ -1237,12 +1274,12 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("amber-anchor".into()),
             branch_name: None,
-            repo_paths: vec![repo_one],
+            repos: default_specs(vec![repo_one]),
         })?;
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_two],
+            repos: default_specs(vec![repo_two]),
         })?;
 
         let preview = manager.clear_preview()?;
@@ -1269,12 +1306,12 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("amber-anchor".into()),
             branch_name: None,
-            repo_paths: vec![repo_one.clone(), repo_two.clone()],
+            repos: default_specs(vec![repo_one.clone(), repo_two.clone()]),
         })?;
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_one.clone(), repo_two.clone()],
+            repos: default_specs(vec![repo_one.clone(), repo_two.clone()]),
         })?;
 
         let result = manager.clear()?;
@@ -1303,12 +1340,12 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("amber-anchor".into()),
             branch_name: None,
-            repo_paths: vec![repo_one.clone()],
+            repos: default_specs(vec![repo_one.clone()]),
         })?;
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_two.clone()],
+            repos: default_specs(vec![repo_two.clone()]),
         })?;
 
         fs::remove_dir_all(manager.base_dir().join("amber-anchor").join("alpha"))?;
