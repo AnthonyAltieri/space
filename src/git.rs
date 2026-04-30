@@ -78,9 +78,9 @@ pub fn repo_root_if_repo(path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(repo_root)))
 }
 
-pub fn has_remote_origin(repo_root: &Path) -> Result<bool> {
+pub fn has_remote(repo_root: &Path, remote: &str) -> Result<bool> {
     let output = run_git_with_current_dir(repo_root, |command| {
-        command.arg("remote").arg("get-url").arg("origin")
+        command.arg("remote").arg("get-url").arg(remote)
     })?;
     Ok(output.status.success())
 }
@@ -218,33 +218,36 @@ pub fn local_branch_exists(repo_root: &Path, branch_name: &str) -> Result<bool> 
     Ok(output.status.success())
 }
 
-pub fn fetch_origin_main(repo_root: &Path) -> Result<()> {
+pub fn fetch_remote_branch(repo_root: &Path, remote: &str, branch: &str) -> Result<()> {
     let output = run_git_with_current_dir(repo_root, |command| {
-        command.arg("fetch").arg("origin").arg("main")
+        command.arg("fetch").arg(remote).arg(branch)
     })?;
-    ensure_success(output, "failed to fetch origin/main")?;
+    ensure_success(output, &format!("failed to fetch {remote}/{branch}"))?;
     Ok(())
 }
 
-pub fn remote_main_exists(repo_root: &Path) -> Result<bool> {
+pub fn remote_branch_exists(repo_root: &Path, remote: &str, branch: &str) -> Result<bool> {
     let output = run_git_with_current_dir(repo_root, |command| {
         command
             .arg("rev-parse")
             .arg("--verify")
             .arg("--quiet")
-            .arg("refs/remotes/origin/main")
+            .arg(format!("refs/remotes/{remote}/{branch}"))
     })?;
     Ok(output.status.success())
 }
 
-pub fn remote_main_commit(repo_root: &Path) -> Result<String> {
+pub fn remote_branch_commit(repo_root: &Path, remote: &str, branch: &str) -> Result<String> {
     let output = run_git_with_current_dir(repo_root, |command| {
         command
             .arg("rev-parse")
             .arg("--verify")
-            .arg("refs/remotes/origin/main")
+            .arg(format!("refs/remotes/{remote}/{branch}"))
     })?;
-    let output = ensure_success(output, "failed to resolve origin/main commit")?;
+    let output = ensure_success(
+        output,
+        &format!("failed to resolve {remote}/{branch} commit"),
+    )?;
     Ok(trim_output(&output.stdout))
 }
 

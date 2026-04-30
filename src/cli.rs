@@ -1,6 +1,7 @@
 use crate::app::{
     default_base_dir, prompt_for_branch_action, AddWorkspaceReposRequest, ClearWorkspacesPreview,
-    CreateWorkspaceRequest, RemoveBranchAction, RemoveWorkspaceRequest, WorkspaceManager,
+    CreateRepoSpec, CreateWorkspaceRequest, RemoveBranchAction, RemoveWorkspaceRequest,
+    WorkspaceManager, DEFAULT_BASE_BRANCH, DEFAULT_BASE_REMOTE,
 };
 use crate::git;
 use crate::repo_picker::{prompt_for_repo_selection as run_repo_picker, RepoPromptOption};
@@ -46,12 +47,16 @@ struct CreateArgs {
     name: Option<String>,
     #[arg(long)]
     branch: Option<String>,
+    #[arg(long, default_value = DEFAULT_BASE_REMOTE)]
+    base_remote: String,
+    #[arg(long, default_value = DEFAULT_BASE_BRANCH)]
+    base_branch: String,
     #[arg(long)]
     base_dir: Option<PathBuf>,
     #[arg(long)]
     json: bool,
     #[arg(required = true)]
-    repos: Vec<PathBuf>,
+    repos: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -241,20 +246,34 @@ where
     }
 }
 
-fn resolve_create_repo_paths<S>(args: &CreateArgs, repo_selector: &mut S) -> Result<Vec<PathBuf>>
+fn resolve_create_repo_specs<S>(
+    args: &CreateArgs,
+    repo_selector: &mut S,
+) -> Result<Vec<CreateRepoSpec>>
 where
     S: RepoSelector,
 {
+    let parsed = args
+        .repos
+        .iter()
+        .map(|raw| parse_repo_arg(raw))
+        .collect::<Result<Vec<_>>>()?;
+
     if !args.interactive {
-        return Ok(args.repos.clone());
+        return Ok(parsed
+            .into_iter()
+            .map(|entry| build_spec(entry, args))
+            .collect());
     }
 
-    if args.repos.len() != 1 {
+    if parsed.len() != 1 {
         bail!("interactive repo selection requires exactly one directory path");
     }
+    if parsed[0].override_remote.is_some() {
+        bail!("interactive repo selection requires a non-repository directory path");
+    }
 
-    let requested_path = &args.repos[0];
-    let Some(discovery_root) = resolve_discovery_root(requested_path)? else {
+    let Some(discovery_root) = resolve_discovery_root(&parsed[0].path)? else {
         bail!("interactive repo selection requires a non-repository directory path");
     };
 
@@ -271,20 +290,79 @@ where
         bail!("no repositories were selected");
     }
 
-    Ok(selected)
+    Ok(selected
+        .into_iter()
+        .map(|path| CreateRepoSpec {
+            path,
+            base_remote: args.base_remote.clone(),
+            base_branch: args.base_branch.clone(),
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+struct ParsedRepoArg {
+    path: PathBuf,
+    override_remote: Option<(String, String)>,
+}
+
+fn parse_repo_arg(raw: &str) -> Result<ParsedRepoArg> {
+    let Some(at_index) = raw.find('@') else {
+        return Ok(ParsedRepoArg {
+            path: PathBuf::from(raw),
+            override_remote: None,
+        });
+    };
+
+    let (path_part, after_at) = raw.split_at(at_index);
+    let spec = &after_at[1..];
+    let Some(slash_index) = spec.find('/') else {
+        return Ok(ParsedRepoArg {
+            path: PathBuf::from(raw),
+            override_remote: None,
+        });
+    };
+
+    let (remote, rest) = spec.split_at(slash_index);
+    let branch = &rest[1..];
+    if path_part.is_empty() {
+        bail!("repository path is empty in `{raw}`");
+    }
+    if remote.is_empty() {
+        bail!("remote name is empty in `{raw}`");
+    }
+    if branch.is_empty() {
+        bail!("branch name is empty in `{raw}`");
+    }
+
+    Ok(ParsedRepoArg {
+        path: PathBuf::from(path_part),
+        override_remote: Some((remote.to_owned(), branch.to_owned())),
+    })
+}
+
+fn build_spec(entry: ParsedRepoArg, args: &CreateArgs) -> CreateRepoSpec {
+    let (base_remote, base_branch) = entry
+        .override_remote
+        .unwrap_or_else(|| (args.base_remote.clone(), args.base_branch.clone()));
+    CreateRepoSpec {
+        path: entry.path,
+        base_remote,
+        base_branch,
+    }
 }
 
 fn run_create<S>(args: CreateArgs, output: &mut dyn Write, repo_selector: &mut S) -> Result<()>
 where
     S: RepoSelector,
 {
-    let repo_paths = resolve_create_repo_paths(&args, repo_selector)?;
-    let base_dir = args.base_dir.unwrap_or(default_base_dir()?);
+    let repos = resolve_create_repo_specs(&args, repo_selector)?;
+    let base_dir = args.base_dir.clone().unwrap_or(default_base_dir()?);
     let manager = WorkspaceManager::new(base_dir);
     let result = manager.create(CreateWorkspaceRequest {
         workspace_name: args.name,
         branch_name: args.branch,
-        repo_paths,
+        repos,
     })?;
     let _ = args.json;
     render(output, true, &result)
@@ -469,8 +547,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{run_from, run_from_with_selector, Cli};
-    use crate::app::{CreateWorkspaceRequest, WorkspaceManager};
+    use super::{parse_repo_arg, run_from, run_from_with_selector, Cli};
+    use crate::app::{
+        CreateRepoSpec, CreateWorkspaceRequest, WorkspaceManager, DEFAULT_BASE_BRANCH,
+        DEFAULT_BASE_REMOTE,
+    };
+
+    fn default_specs(paths: Vec<PathBuf>) -> Vec<CreateRepoSpec> {
+        paths
+            .into_iter()
+            .map(|path| CreateRepoSpec {
+                path,
+                base_remote: DEFAULT_BASE_REMOTE.into(),
+                base_branch: DEFAULT_BASE_BRANCH.into(),
+            })
+            .collect()
+    }
     use crate::git;
     use crate::registry::{Registry, RegistryStore, WorkspaceRecord};
     use anyhow::Context;
@@ -567,12 +659,12 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("amber-anchor".into()),
             branch_name: None,
-            repo_paths: vec![repo_one.clone()],
+            repos: default_specs(vec![repo_one.clone()]),
         })?;
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_two.clone()],
+            repos: default_specs(vec![repo_two.clone()]),
         })?;
 
         let mut input = Cursor::new(b"y\n".to_vec());
@@ -628,7 +720,7 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_path.clone()],
+            repos: default_specs(vec![repo_path.clone()]),
         })?;
 
         let mut input = Cursor::new(b"yes\n".to_vec());
@@ -688,7 +780,7 @@ mod tests {
         let created = manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_path],
+            repos: default_specs(vec![repo_path]),
         })?;
 
         let mut input = Cursor::new(Vec::<u8>::new());
@@ -1124,7 +1216,7 @@ mod tests {
         manager.create(CreateWorkspaceRequest {
             workspace_name: Some("steady-trail".into()),
             branch_name: None,
-            repo_paths: vec![repo_one],
+            repos: default_specs(vec![repo_one]),
         })?;
 
         let mut input = Cursor::new(Vec::<u8>::new());
@@ -1389,6 +1481,181 @@ mod tests {
             .find("{\n  \"registry_path\"")
             .context("clear output did not include a JSON summary")?;
         serde_json::from_str(&output[start..]).context("failed to parse clear JSON summary")
+    }
+
+    #[test]
+    fn parse_repo_arg_returns_path_when_no_at_sign() -> Result<()> {
+        let parsed = parse_repo_arg("/tmp/alpha")?;
+        assert_eq!(parsed.path, PathBuf::from("/tmp/alpha"));
+        assert!(parsed.override_remote.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_repo_arg_extracts_remote_and_branch() -> Result<()> {
+        let parsed = parse_repo_arg("/tmp/alpha@upstream/release/2026.04")?;
+        assert_eq!(parsed.path, PathBuf::from("/tmp/alpha"));
+        assert_eq!(
+            parsed.override_remote,
+            Some(("upstream".to_owned(), "release/2026.04".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_repo_arg_treats_at_without_slash_as_path() -> Result<()> {
+        let parsed = parse_repo_arg("/tmp/foo@bar")?;
+        assert_eq!(parsed.path, PathBuf::from("/tmp/foo@bar"));
+        assert!(parsed.override_remote.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_repo_arg_rejects_empty_remote_or_branch() {
+        assert!(parse_repo_arg("/tmp/alpha@/main").is_err());
+        assert!(parse_repo_arg("/tmp/alpha@origin/").is_err());
+        assert!(parse_repo_arg("@origin/main").is_err());
+    }
+
+    #[test]
+    fn create_uses_base_branch_flag_for_workspace_default() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let repo_path = init_repo(temp.path(), "alpha")?;
+        let repo_path = fs::canonicalize(repo_path)?;
+        push_extra_branch(&repo_path, "release/2026.04", "release")?;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "create",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+                "--name",
+                "calm-river",
+                "--base-branch",
+                "release/2026.04",
+                "--json",
+                repo_path.to_str().expect("utf-8 path"),
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        let value = parse_create_json(&output)?;
+        let repos = value["repos"].as_array().expect("repos array");
+        assert_eq!(repos.len(), 1);
+        let release_commit = git_rev_parse(&repo_path, "refs/remotes/origin/release/2026.04")?;
+        assert_eq!(repos[0]["base_commit"], Value::String(release_commit));
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_at_spec_overrides_workspace_default_per_repo() -> Result<()> {
+        let temp = tempdir()?;
+        let base_dir = temp.path().join("spaces-home");
+        let repo_one = fs::canonicalize(init_repo(temp.path(), "alpha")?)?;
+        let repo_two = fs::canonicalize(init_repo(temp.path(), "beta")?)?;
+        push_extra_branch(&repo_two, "feature/x", "feature x")?;
+
+        let beta_arg = format!(
+            "{}@origin/feature/x",
+            repo_two.to_str().expect("utf-8 path")
+        );
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        run_from(
+            [
+                "spaces",
+                "create",
+                "--base-dir",
+                base_dir.to_str().expect("utf-8 path"),
+                "--name",
+                "split-base",
+                "--json",
+                repo_one.to_str().expect("utf-8 path"),
+                &beta_arg,
+            ],
+            &mut input,
+            &mut output,
+        )?;
+
+        let value = parse_create_json(&output)?;
+        let repos = value["repos"].as_array().expect("repos array");
+        assert_eq!(repos.len(), 2);
+
+        let alpha_main = git_rev_parse(&repo_one, "refs/remotes/origin/main")?;
+        let beta_feature = git_rev_parse(&repo_two, "refs/remotes/origin/feature/x")?;
+
+        let alpha_entry = repos
+            .iter()
+            .find(|repo| repo["repo_name"] == "alpha")
+            .expect("alpha repo");
+        let beta_entry = repos
+            .iter()
+            .find(|repo| repo["repo_name"] == "beta")
+            .expect("beta repo");
+        assert_eq!(alpha_entry["base_commit"], Value::String(alpha_main));
+        assert_eq!(beta_entry["base_commit"], Value::String(beta_feature));
+
+        Ok(())
+    }
+
+    fn parse_create_json(output: &[u8]) -> Result<Value> {
+        let text = std::str::from_utf8(output)?;
+        let start = text
+            .find("{\n  \"workspace_name\"")
+            .context("create output did not include a JSON summary")?;
+        Ok(serde_json::from_str(&text[start..])?)
+    }
+
+    fn git_rev_parse(repo_root: &Path, reference: &str) -> Result<String> {
+        let output = Command::new("git")
+            .current_dir(repo_root)
+            .arg("rev-parse")
+            .arg(reference)
+            .output()
+            .context("failed to run git rev-parse")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git rev-parse {reference} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+
+    fn push_extra_branch(repo_path: &Path, branch: &str, message: &str) -> Result<()> {
+        run(Command::new("git")
+            .current_dir(repo_path)
+            .arg("checkout")
+            .arg("-b")
+            .arg(branch))?;
+        fs::write(repo_path.join(format!("{message}.txt")), message)?;
+        run(Command::new("git")
+            .current_dir(repo_path)
+            .arg("add")
+            .arg("."))?;
+        run(Command::new("git")
+            .current_dir(repo_path)
+            .arg("commit")
+            .arg("-m")
+            .arg(message))?;
+        run(Command::new("git")
+            .current_dir(repo_path)
+            .arg("push")
+            .arg("-u")
+            .arg("origin")
+            .arg(branch))?;
+        run(Command::new("git")
+            .current_dir(repo_path)
+            .arg("checkout")
+            .arg("main"))?;
+        Ok(())
     }
 
     fn init_repo(base_dir: &Path, name: &str) -> Result<PathBuf> {
